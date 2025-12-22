@@ -32,6 +32,14 @@ using namespace std;
 // 顯示模式 (依照作業要求)
 int outputMode = 0; // 0:Default, 1:-d, 2:-s, 3:-a
 
+
+struct ClientContext {
+    int sock;
+    SSL* ssl;
+};
+
+
+
 struct Account {
     string name;        // 使用者名稱 (例如: "Alice")
     int balance;        // 帳戶餘額 (作業規定預設 10000)
@@ -551,6 +559,9 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+
+
+
     // 顯示啟動成功的訊息與目前的模式
     cout << "Server started on port " << port;
     if (outputMode == 1) cout << " (Mode: -d)";
@@ -576,12 +587,40 @@ int main(int argc, char *argv[]) {
         // 如果連線失敗 (例如被訊號中斷)，就忽略，繼續等下一個
         if (clientSock < 0) continue;
 
+
+
+
+        // ================================
+        // TLS Handshake（Server Side）
+        // ================================
+
+        // 建立一個 SSL 連線狀態（使用共用的 sslCtx）
+        SSL* ssl = SSL_new(sslCtx);
+
+        // 將 TCP socket 綁定給 SSL
+        SSL_set_fd(ssl, clientSock);
+
+        // 執行 TLS 握手
+        if (SSL_accept(ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(clientSock);
+            continue;
+        }
+
+
+
+
+
         // [記憶體配置] 為執行緒準備參數
         // 因為 pthread_create 需要傳指標，我們不能直接傳區域變數的位址 (會有 Race Condition)。
         // 所以用 new 配置一塊新的記憶體，把 clientSock 的值抄進去。
         // 這塊記憶體會由 clientHandler 負責 delete (free)。
-        int* newSock = new int;
-        *newSock = clientSock;
+        ClientContext* ctxClient = new ClientContext;
+        ctxClient->sock = clientSock;
+        ctxClient->ssl  = ssl;
+
+        
 
         // [多執行緒 - 派工] 建立 Worker Thread
         // 參數說明:
@@ -590,7 +629,7 @@ int main(int argc, char *argv[]) {
         // 3. clientHandler: 新執行緒要跑的函式 
         // 4. (void*)newSock: 傳給函式的參數 (也就是剛剛拿到的分機號碼)
         pthread_t tid;
-        pthread_create(&tid, NULL, clientHandler, (void*)newSock);
+        pthread_create(&tid, NULL, clientHandler, (void*)ctxClient);
         
         // [分離執行緒] Fire and Forget
         // 告訴系統：「這個執行緒跑完自己收屍就好，主程式不會在那邊等它 (join)」。
