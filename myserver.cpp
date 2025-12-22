@@ -520,7 +520,37 @@ int main(int argc, char *argv[]) {
     // 參數 10 (Backlog): 指定「同時等待接聽」的佇列長度。
     // 如果 Server 很忙還沒 accept，最多允許 10 個人在線上排隊，第 11 個會被拒絕。
     listen(serverSocket, 10);
+
+
+    // ================================
+    // TLS / OpenSSL Context 初始化
+    // ================================
+
+    // 建立一個 TLS Server 的 Context（設定藍圖）
+    SSL_CTX* sslCtx = SSL_CTX_new(TLS_server_method());
+    if (!sslCtx) {
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
     
+    // 載入 Server Certificate（公鑰 + 身分資訊）
+    if (SSL_CTX_use_certificate_file(sslCtx, "mycert.pem", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+
+    // 載入 Server Private Key
+    if (SSL_CTX_use_PrivateKey_file(sslCtx, "mykey.pem", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+
+    // 檢查 Private Key 是否與 Certificate 相符
+    if (!SSL_CTX_check_private_key(sslCtx)) {
+        cerr << "Private key does not match the certificate!" << endl;
+        return -1;
+    }
+
     // 顯示啟動成功的訊息與目前的模式
     cout << "Server started on port " << port;
     if (outputMode == 1) cout << " (Mode: -d)";
