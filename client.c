@@ -47,6 +47,7 @@ static int connect_peer(const char* ip, int port);                             /
 static int create_listen_socket(int port);                                     //建立、綁定並 listen 在指定 port 的 TCP listening socket，回傳 listening socket fd，失敗回傳 -1。
 static OnlineUser* find_online_user(const char* username);                     //在本地維護的 OnlineUser 清單中搜尋 username，若找到回傳指標，否則回傳 NULL。
 static void send_line(int sd, const char* msg);                                //將 msg 透過非 TLS 的 socket sd 傳送出去，確保整行送出。
+static void send_line_ssl(SSL *ssl, const char* msg);                          //將 msg 透過 SSL/TLS 連線 ssl 傳送出去，確保整行送出。
 static int recv_full_burst(int sd, char *out, int out_sz);                     //從 socket sd 讀取可用的資料塊直到沒有資料或緩衝滿為止，將資料寫入 out，回傳讀到的位元組數。
 static void update_online_users(const char* response);                         //解析伺服器回傳的線上使用者列表 response，更新本地的 OnlineUser 清單（新增/移除/更新狀態）。
 static void handle_p2p_transfer(const char* receiver, int amount);       //發起對 receiver 的 P2P 轉帳流程：可能先通知伺服器取得對方資訊，建立 P2P 連線並傳送金額等資料。
@@ -190,6 +191,22 @@ static void send_line(int sd, const char* msg) {
 }
 
 
+//------------------------------------------------------------------------------
+// 透過 SSL/TLS 送資料
+//------------------------------------------------------------------------------
+static void send_line_ssl(SSL *ssl, const char* msg) {
+    char buf[BUFSZ];
+    int len = snprintf(buf, sizeof(buf), "%s", msg);
+
+    int n = SSL_write(ssl, buf, len);
+    if (n <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+}
+
+
+
 
 //------------------------------------------------------------------------------
 // 從 server 收一整「波」資料（避免 Transfer OK 黏到下一條）
@@ -223,6 +240,21 @@ static int recv_full_burst(int sd, char *out, int out_sz) {
     }
     return total;
 }
+
+
+
+static int recv_full_burst_ssl(SSL *ssl, char *out, int out_sz) {
+    int total = 0;
+    out[0] = '\0';
+
+    int n = SSL_read(ssl, out, out_sz - 1);
+    if (n <= 0) return n;
+
+    total += n;
+    out[total] = '\0';
+    return total;
+}
+
 
 
 //------------------------------------------------------------------------------
@@ -449,7 +481,33 @@ int main(int argc, char **argv)
     const char *ip = argv[1];
     int port = atoi(argv[2]);
 
+    // 初始化 OpenSSL 函式庫
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+
+    if (!ctx) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+
     int sd = connect_tcp(ip, port);
+
+    // 建立 SSL 連線
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sd);
+
+    if (SSL_connect(ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
     printf("\n===== Connected to %s:%d =====\n", ip, port);
     show_menu();
 
@@ -506,7 +564,7 @@ int main(int argc, char **argv)
         // ================================
         if (FD_ISSET(sd, &rfds)) {
             memset(recvbuf, 0, sizeof(recvbuf));
-            int n = recv(sd, recvbuf, sizeof(recvbuf) - 1, 0);
+            int n = SSL_read(ssl, recvbuf, sizeof(recvbuf) - 1);
             if (n > 0) recvbuf[n] = '\0'; // recv() 不會自動加結尾，手動加上
 
             
@@ -597,10 +655,10 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            send_line(sd, line);
+            send_line_ssl(ssl, line);
 
             memset(recvbuf, 0, sizeof(recvbuf));
-            int n = recv_full_burst(sd, recvbuf, sizeof(recvbuf));
+            int n = recv_full_burst_ssl(ssl, recvbuf, sizeof(recvbuf));
             if (n > 0) {
                 printf("\n\n#====== Server Reply: ======#\n");
                 printf("%s", recvbuf);

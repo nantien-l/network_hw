@@ -460,6 +460,8 @@ int main(int argc, char *argv[]) {
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();   
+
+    
     
     // [參數檢查] 
     // 規定 Server 啟動指令格式為: ./server <port> [Option]
@@ -540,6 +542,11 @@ int main(int argc, char *argv[]) {
 
     // 建立一個 TLS Server 的 Context（設定藍圖）
     SSL_CTX* sslCtx = SSL_CTX_new(TLS_server_method());
+
+    SSL_CTX_set_min_proto_version(sslCtx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(sslCtx, TLS1_2_VERSION);
+
+    
     if (!sslCtx) {
         ERR_print_errors_fp(stderr);
         return -1;
