@@ -21,6 +21,9 @@
 #include <algorithm>
 #include <map>
 #include <iomanip>
+// 先加上去 這一定不會錯....
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 using namespace std;
 
@@ -439,6 +442,12 @@ void* clientHandler(void* clientSocketPtr) {
 // argc: 參數個數 (Argument Count)
 // argv: 參數內容陣列 (Argument Vector)，例如 ./server 8888 -a
 int main(int argc, char *argv[]) {
+
+
+    // 初始化 OpenSSL 函式庫 （新步驟）
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();   
     
     // [參數檢查] 
     // 規定 Server 啟動指令格式為: ./server <port> [Option]
