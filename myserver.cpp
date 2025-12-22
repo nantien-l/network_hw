@@ -169,13 +169,12 @@ string generateListMessage(const string& requestorName) {
 void* clientHandler(void* clientSocketPtr) {
     
     // [記憶體管理] 
-    // 1. 將 void* 指標強制轉型回 int* 指標，再取值 (*)，拿到真正的 Socket ID (例如: 4)
-    int clientSock = *(int*)clientSocketPtr;
-    
-    // 2. [關鍵] 釋放記憶體
-    // 主程式在 accept 後使用了 'new int' 配置記憶體來傳遞 socket。
-    // 如果這裡不 free，每有一個人連線就會洩漏 4 bytes 記憶體 (Memory Leak)。
-    free(clientSocketPtr); 
+    ClientContext* ctxClient = (ClientContext*)clientSocketPtr;
+
+    int clientSock = ctxClient->sock;
+    SSL* ssl = ctxClient->ssl;
+
+    delete ctxClient;
 
     // [緩衝區準備]
     // 準備一個 4096 bytes 的大陣列來暫存收到的資料
@@ -203,7 +202,7 @@ void* clientHandler(void* clientSocketPtr) {
         // 2. buffer: 讀到的資料放哪
         // 3. sizeof-1: 預留最後一個 byte 給字串結尾符號 '\0'
         // 4. 0: 預設 flag
-        int bytesReceived = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+        int bytesReceived = SSL_read(ssl, buffer, sizeof(buffer) - 1);
         
         // [斷線判斷]
         // 如果回傳值 <= 0，代表發生狀況：
@@ -370,12 +369,11 @@ void* clientHandler(void* clientSocketPtr) {
             response = "Bye\n";
             
             // 這裡直接送出 Bye，然後下面會 break 跳出迴圈
-            send(clientSock, response.c_str(), response.length(), 0);
+            SSL_write(ssl, response.c_str(), response.length());
             
             // [重要] 因為要 break 了，必須在這裡解鎖，不然 Mutex 會永遠被鎖住 (Deadlock)
             pthread_mutex_unlock(&accountsMutex); 
             
-            close(clientSock); // 關閉連線
             break; // 跳出 while 迴圈
         }
         
@@ -429,7 +427,7 @@ void* clientHandler(void* clientSocketPtr) {
         // [發送回應]
         // 如果 response 不是空的，就透過 socket 傳回給 Client
         if (!response.empty()) {
-            send(clientSock, response.c_str(), response.length(), 0);
+            SSL_write(ssl, response.c_str(), response.length());
             
             // [作業要求 -a] 顯示送出去的內容 (Debug)
             if (outputMode >= 3) {
@@ -440,6 +438,12 @@ void* clientHandler(void* clientSocketPtr) {
             }
         }
     }
+
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(clientSock);
+
     return NULL;
 }
 
