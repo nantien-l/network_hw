@@ -50,7 +50,7 @@ static void send_line(int sd, const char* msg);                                /
 static void send_line_ssl(SSL *ssl, const char* msg);                          //將 msg 透過 SSL/TLS 連線 ssl 傳送出去，確保整行送出。
 static int recv_full_burst(int sd, char *out, int out_sz);                     //從 socket sd 讀取可用的資料塊直到沒有資料或緩衝滿為止，將資料寫入 out，回傳讀到的位元組數。
 static void update_online_users(const char* response);                         //解析伺服器回傳的線上使用者列表 response，更新本地的 OnlineUser 清單（新增/移除/更新狀態）。
-static void handle_p2p_transfer(const char* receiver, int amount);       //發起對 receiver 的 P2P 轉帳流程：可能先通知伺服器取得對方資訊，建立 P2P 連線並傳送金額等資料。
+static void handle_p2p_transfer(const char* receiver, int amount, SSL *ssl);       //發起對 receiver 的 P2P 轉帳流程：可能先通知伺服器取得對方資訊，建立 P2P 連線並傳送金額等資料。
 static void handle_incoming_p2p(int p2p_sd, SSL *ssl);                 //處理來自其他 peer 的傳入 P2P 連線（由 p2p_sd 接受），接收傳輸資料並視情況向伺服器回報/確認。
 
 //------------------------------------------------------------------------------
@@ -339,7 +339,7 @@ static void update_online_users(const char* response) {
 //------------------------------------------------------------------------------
 // P2P 轉帳：只負責通知對方，不碰 server socket
 //------------------------------------------------------------------------------
-static void handle_p2p_transfer(const char* receiver, int amount) {
+static void handle_p2p_transfer(const char* receiver, int amount, SSL *ssl){
 
     if (my_name[0] == '\0') {
         printf("[WARN] 尚未登入，無法轉帳。\n");
@@ -383,6 +383,10 @@ static void handle_p2p_transfer(const char* receiver, int amount) {
 
     printf("[INFO] 已送出轉帳請求：%s → %s (%d)\n",
            my_name, receiver, amount);
+
+
+        // 付款方主動向 server 要最新狀態（非同步）
+        send_line_ssl(ssl, "List");
 
     // ❗❗ 不要 List、不睡、不 drain server
     // 由於對方收到後會 pending_cmd → main 下一輪會自動更新
@@ -644,7 +648,7 @@ int main(int argc, char **argv)
                 }
 
                 printf("\n[LOCAL] 確認 %s → %s (%d)\n", sender, receiver, amount);
-                handle_p2p_transfer(receiver, amount);
+                handle_p2p_transfer(receiver, amount, ssl);
                 continue;
             }
 
