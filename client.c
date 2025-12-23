@@ -51,7 +51,7 @@ static void send_line_ssl(SSL *ssl, const char* msg);                          /
 static int recv_full_burst(int sd, char *out, int out_sz);                     //從 socket sd 讀取可用的資料塊直到沒有資料或緩衝滿為止，將資料寫入 out，回傳讀到的位元組數。
 static void update_online_users(const char* response);                         //解析伺服器回傳的線上使用者列表 response，更新本地的 OnlineUser 清單（新增/移除/更新狀態）。
 static void handle_p2p_transfer(const char* receiver, int amount);       //發起對 receiver 的 P2P 轉帳流程：可能先通知伺服器取得對方資訊，建立 P2P 連線並傳送金額等資料。
-static void handle_incoming_p2p(int p2p_sd, int server_sd);                     //處理來自其他 peer 的傳入 P2P 連線（由 p2p_sd 接受），接收傳輸資料並視情況向伺服器回報/確認。
+static void handle_incoming_p2p(int p2p_sd, SSL *ssl);                 //處理來自其他 peer 的傳入 P2P 連線（由 p2p_sd 接受），接收傳輸資料並視情況向伺服器回報/確認。
 
 //------------------------------------------------------------------------------
 // 工具：把字串尾端所有  "\r"、"\n"、" "、"\t" 砍掉
@@ -393,7 +393,7 @@ static void handle_p2p_transfer(const char* receiver, int amount) {
 //------------------------------------------------------------------------------
 // 處理來自其他 client 的 P2P 傳入連線（完全無阻塞版）
 //------------------------------------------------------------------------------
-static void handle_incoming_p2p(int p2p_sd, int server_sd) {
+static void handle_incoming_p2p(int p2p_sd, SSL *ssl) {
 
     struct sockaddr_in cli;
     socklen_t len = sizeof(cli);
@@ -420,7 +420,7 @@ static void handle_incoming_p2p(int p2p_sd, int server_sd) {
     fflush(stdout); 
 
     // 2. 直接將指令轉發給 Server
-    send_line(server_sd, buf); 
+     send_line_ssl(ssl, buf);   // ✅ 一定要走 TLS 
     
     // 3. 更新全域狀態
     g_client_state = 1; // 進入 "AWAITING_TRANSFER_OK" 狀態
@@ -547,14 +547,16 @@ int main(int argc, char **argv)
         // 🔵 1. 處理 P2P 收款事件
         // ================================
         if (listen_sd != -1 && FD_ISSET(listen_sd, &rfds)) {
-            handle_incoming_p2p(listen_sd, sd);
+            handle_incoming_p2p(listen_sd, ssl);
 
+            /*
             if (g_client_state == 1) {
                 // 狀態 1：我們剛收到了 "Transfer OK" (推測)
                 // 接著，我們必須送出 "List" 來更新餘額
-                send_line(sd, "List");
+                ssend_line_ssl(ssl, "List");  // ✅ TLS
                 g_client_state = 2; // 進入 "AWAITING_LIST_AFTER_TRANSFER" 狀態
             } 
+                */
         }
 
         
@@ -564,13 +566,29 @@ int main(int argc, char **argv)
         // ================================
         if (FD_ISSET(sd, &rfds)) {
             memset(recvbuf, 0, sizeof(recvbuf));
-            int n = SSL_read(ssl, recvbuf, sizeof(recvbuf) - 1);
-            if (n > 0) recvbuf[n] = '\0'; // recv() 不會自動加結尾，手動加上
 
-            
-            if (n <= 0) {
-                printf("[INFO] Server closed.\n");
-                break;
+            int n = SSL_read(ssl, recvbuf, sizeof(recvbuf) - 1);
+
+            if (n > 0) {
+                recvbuf[n] = '\0';
+            }
+            else {
+                int err = SSL_get_error(ssl, n);
+
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                    // TLS 還沒準備好，等等再來
+                    continue;
+                }
+                else if (err == SSL_ERROR_ZERO_RETURN) {
+                    // 正常 TLS 關閉 (close_notify)
+                    printf("[INFO] Server closed TLS connection.\n");
+                    break;
+                }
+                else {
+                    // 真正的錯誤
+                    ERR_print_errors_fp(stderr);
+                    break;
+                }
             }
             
             // 無論如何，都先印出收到的訊息
@@ -580,20 +598,19 @@ int main(int argc, char **argv)
 
 
             // 根據我們的狀態機，決定下一步動作
-            if (g_client_state == 1) {
-                // 狀態 1：我們剛收到了 "Transfer OK" (推測)
-                // 接著，我們必須送出 "List" 來更新餘額
-                send_line(sd, "List");
-                g_client_state = 2; // 進入 "AWAITING_LIST_AFTER_TRANSFER" 狀態
-            } 
-            else if (g_client_state == 2) {
-                // 狀態 2：我們剛收到了 "List" 的回覆
-                // 更新餘額和列表
+            // 任何 server 回來的 List，都更新 online_users
+            if (strchr(recvbuf, '\n')) {
                 update_online_users(recvbuf);
-                g_client_state = 0; // 回到 IDLE 閒置狀態
             }
-            // 如果 g_client_state == 0，代表這只是 Server 的一般訊息
-            // (例如別人登入登出)，我們印出訊息就好，不用做任何事。
+
+            // P2P 狀態機只負責「流程控制」
+            if (g_client_state == 1) {
+                send_line_ssl(ssl, "List");   // ❗一定要 TLS
+                g_client_state = 2;
+            }
+            else if (g_client_state == 2) {
+                g_client_state = 0;
+            }
         }
 
         // ================================
@@ -657,6 +674,7 @@ int main(int argc, char **argv)
 
             send_line_ssl(ssl, line);
 
+            /*
             memset(recvbuf, 0, sizeof(recvbuf));
             int n = recv_full_burst_ssl(ssl, recvbuf, sizeof(recvbuf));
             if (n > 0) {
@@ -671,6 +689,7 @@ int main(int argc, char **argv)
                 
                 printf("#===========================#\n\n");
             }
+                */
 
             if (strcasecmp(line, "Exit") == 0)
                 break;
