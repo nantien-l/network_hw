@@ -486,14 +486,14 @@ int main(int argc, char **argv)
     int port = atoi(argv[2]);
 
     // 初始化 OpenSSL 函式庫
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_all_algorithms();
+    SSL_library_init();                 // 1. 載入 SSL/TLS 函式庫
+    SSL_load_error_strings();           // 2. 載入錯誤訊息
+    OpenSSL_add_all_algorithms();       // 3. 載入所有加密演算法（AES, RSA, SHA...）
 
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());            // 建立 TLS client context
     
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);         // 只用 TLS 1.2
 
     if (!ctx) {
         ERR_print_errors_fp(stderr);
@@ -504,7 +504,10 @@ int main(int argc, char **argv)
     int sd = connect_tcp(ip, port);
 
     // 建立 SSL 連線
-    SSL *ssl = SSL_new(ctx);
+    // 與 Server 進行 TLS handshake：
+    // 1. 使用非對稱加密交換 session key
+    // 2. 建立安全的對稱加密通道
+    SSL *ssl = SSL_new(ctx);             // 建立 SSL 結構
     SSL_set_fd(ssl, sd);
 
     if (SSL_connect(ssl) <= 0) {
