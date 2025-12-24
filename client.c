@@ -13,6 +13,8 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <asm-generic/socket.h>
+#include <ctype.h>
+
 
 // ---- 統一緩衝區大小：4KB ----
 #define BUFSZ 4096
@@ -385,8 +387,6 @@ static void handle_p2p_transfer(const char* receiver, int amount, SSL *ssl){
            my_name, receiver, amount);
 
 
-        // 付款方主動向 server 要最新狀態（非同步）
-        send_line_ssl(ssl, "List");
 
     // ❗❗ 不要 List、不睡、不 drain server
     // 由於對方收到後會 pending_cmd → main 下一輪會自動更新
@@ -603,8 +603,10 @@ int main(int argc, char **argv)
 
             // 根據我們的狀態機，決定下一步動作
             // 任何 server 回來的 List，都更新 online_users
-            if (strchr(recvbuf, '\n')) {
+            // ✅ 只有真正的 List 回覆才更新
+            if (isdigit((unsigned char)recvbuf[0])) {
                 update_online_users(recvbuf);
+                show_menu();
             }
 
             // P2P 狀態機只負責「流程控制」
@@ -698,7 +700,6 @@ int main(int argc, char **argv)
             if (strcasecmp(line, "Exit") == 0)
                 break;
             
-            show_menu();
         }
 
     }
