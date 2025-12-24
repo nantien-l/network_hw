@@ -587,9 +587,18 @@ int main(int argc, char **argv)
                     continue;
                 }
                 else if (err == SSL_ERROR_ZERO_RETURN) {
-                    // 正常 TLS 關閉 (close_notify)
                     printf("[INFO] Server closed TLS connection.\n");
-                    break;
+
+                    // 正確關閉 TLS 連線
+                    SSL_shutdown(ssl);
+                    SSL_free(ssl);
+                    close(sd);
+
+                    // ❗不要 break 掉整個程式
+                    // 視你的設計，二選一：
+
+                    // 選項 A：直接結束這個 client（最簡單、安全）
+                    return 0;
                 }
                 else {
                     // 真正的錯誤

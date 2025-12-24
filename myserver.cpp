@@ -209,39 +209,26 @@ void* clientHandler(void* clientSocketPtr) {
         // 0: Client 正常關閉連線 (Called close())
         // -1: 發生錯誤 (Error)
         if (bytesReceived <= 0) {
-            
-            // 如果這個連線已經登入過 (currentUserName 有值)，我們要幫他「登出」
+        int err = SSL_get_error(ssl, bytesReceived);
+
+        if (err == SSL_ERROR_ZERO_RETURN) {
+            // ✅ Client 正常 TLS 關閉（Exit）
             if (!currentUserName.empty()) {
-                
-                // [執行緒安全 - 上鎖]
-                // 因為我們要修改全域變數 'accounts'，必須先鎖住，
-                // 避免此時有另一個 Thread 剛好在轉帳給這個人，造成資料錯亂 (Race Condition)。
                 pthread_mutex_lock(&accountsMutex);
-                
-                // 修改狀態：設為離線
-                accounts[currentUserName].isOnline = false; 
-                
-                // [作業要求 -d] 顯示離線訊息
-                if (outputMode >= 1) {
-                    cout << "[Info] User " << currentUserName << " disconnected." << endl;
-                }
-                // [作業要求 -s] 離線後顯示最新列表 (方便助教檢查)
-                if (outputMode >= 2) {
-                    printServerSideList();
-                }
-                
-                // [執行緒安全 - 解鎖]
-                // 修改完畢，解鎖讓其他人可以用
+                accounts[currentUserName].isOnline = false;
                 pthread_mutex_unlock(&accountsMutex);
             }
-            
-            // [資源回收] 
-            // 關閉 Socket，釋放作業系統的 File Descriptor 資源
-            close(clientSock); 
-            
-            // 跳出 while 迴圈 -> 函式結束 -> Thread 結束
-            break; 
         }
+        else if (err == SSL_ERROR_SYSCALL) {
+            // TCP 被關（也算正常）
+        }
+        else {
+            // ❗真正的 TLS 錯誤
+            ERR_print_errors_fp(stderr);
+        }
+
+        break; // ❗只結束這個 client thread
+    }
 
         // [資料處理]
         // 將 char 陣列轉換成 C++ 的 string 物件，方便後續處理
@@ -366,10 +353,7 @@ void* clientHandler(void* clientSocketPtr) {
                 // [作業要求 -s] 印出剩餘線上名單
                 if (outputMode >= 2) printServerSideList();
             }
-            response = "Bye\n";
             
-            // 這裡直接送出 Bye，然後下面會 break 跳出迴圈
-            SSL_write(ssl, response.c_str(), response.length());
             
             // [重要] 因為要 break 了，必須在這裡解鎖，不然 Mutex 會永遠被鎖住 (Deadlock)
             pthread_mutex_unlock(&accountsMutex); 
