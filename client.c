@@ -36,6 +36,9 @@ int my_port = 0;                        // 自己的 port
 OnlineUser online_users[MAX_ONLINE_USERS];
 int num_online_users = 0;
 int my_balance = 10000;                 // 本地紀錄的餘額，預設 10000
+SSL_CTX *p2p_client_ctx = NULL;
+SSL_CTX *p2p_server_ctx = NULL;
+
 
 // 0 = IDLE (閒置)
 // 1 = AWAITING_TRANSFER_OK (剛P2P收款，已送指令給Server，等待 "Transfer OK")
@@ -52,8 +55,8 @@ static void send_line(int sd, const char* msg);                                /
 static void send_line_ssl(SSL *ssl, const char* msg);                          //將 msg 透過 SSL/TLS 連線 ssl 傳送出去，確保整行送出。
 static int recv_full_burst(int sd, char *out, int out_sz);                     //從 socket sd 讀取可用的資料塊直到沒有資料或緩衝滿為止，將資料寫入 out，回傳讀到的位元組數。
 static void update_online_users(const char* response);                         //解析伺服器回傳的線上使用者列表 response，更新本地的 OnlineUser 清單（新增/移除/更新狀態）。
-static void handle_p2p_transfer(const char* receiver, int amount, SSL *ssl);       //發起對 receiver 的 P2P 轉帳流程：可能先通知伺服器取得對方資訊，建立 P2P 連線並傳送金額等資料。
-static void handle_incoming_p2p(int p2p_sd, SSL *ssl);                 //處理來自其他 peer 的傳入 P2P 連線（由 p2p_sd 接受），接收傳輸資料並視情況向伺服器回報/確認。
+static void handle_p2p_transfer(const char* receiver, int amount, SSL *server_ssl);      //發起對 receiver 的 P2P 轉帳流程：可能先通知伺服器取得對方資訊，建立 P2P 連線並傳送金額等資料。
+static void handle_incoming_p2p(int p2p_sd, SSL *server_ssl);              //處理來自其他 peer 的傳入 P2P 連線（由 p2p_sd 接受），接收傳輸資料並視情況向伺服器回報/確認。
 
 //------------------------------------------------------------------------------
 // 工具：把字串尾端所有  "\r"、"\n"、" "、"\t" 砍掉
@@ -338,10 +341,11 @@ static void update_online_users(const char* response) {
     }
 }
 
+
 //------------------------------------------------------------------------------
-// P2P 轉帳：只負責通知對方，不碰 server socket
+// P2P 轉帳（TLS 版）
 //------------------------------------------------------------------------------
-static void handle_p2p_transfer(const char* receiver, int amount, SSL *ssl){
+static void handle_p2p_transfer(const char* receiver, int amount, SSL *server_ssl){
 
     if (my_name[0] == '\0') {
         printf("[WARN] 尚未登入，無法轉帳。\n");
@@ -362,52 +366,83 @@ static void handle_p2p_transfer(const char* receiver, int amount, SSL *ssl){
         return;
     }
 
-    // 建立 P2P 連線
+    // 1️⃣ 建立 TCP 連線
     int peer_sd = connect_peer(target->ip, target->port);
     if (peer_sd < 0) {
-        printf("[WARN] 無法連線至 %s@%s:%d\n", receiver, target->ip, target->port);
+        printf("[WARN] 無法連線至 %s@%s:%d\n",
+               receiver, target->ip, target->port);
         return;
     }
 
-    // 傳送訊息
-    char msg[BUFSZ];
-    snprintf(msg, sizeof(msg), "%s#%d#%s", my_name, amount, receiver);
+    // 2️⃣ 建立 TLS（我是 client）
+    SSL *p2p_ssl = SSL_new(p2p_client_ctx);
+    SSL_set_fd(p2p_ssl, peer_sd);
 
-    ssize_t n = send(peer_sd, msg, strlen(msg), 0);
-    if (n < 0) {
-        perror("[P2P] send");
+    if (SSL_connect(p2p_ssl) <= 0) {
+        printf("[P2P][TLS] SSL_connect failed\n");
+        ERR_print_errors_fp(stderr);
+        SSL_free(p2p_ssl);
         close(peer_sd);
         return;
     }
 
-    shutdown(peer_sd, SHUT_WR);
+    // 3️⃣ 傳送轉帳資料（走 TLS）
+    char msg[BUFSZ];
+    snprintf(msg, sizeof(msg), "%s#%d#%s", my_name, amount, receiver);
+
+    int n = SSL_write(p2p_ssl, msg, strlen(msg));
+    if (n <= 0) {
+        printf("[P2P][TLS] SSL_write failed\n");
+        ERR_print_errors_fp(stderr);
+    }
+
+    // 4️⃣ 正確關閉 TLS + socket
+    SSL_shutdown(p2p_ssl);
+    SSL_free(p2p_ssl);
     close(peer_sd);
 
-    printf("[INFO] 已送出轉帳請求：%s → %s (%d)\n",
+    printf("[INFO] 已送出轉帳請求（TLS）：%s → %s (%d)\n",
            my_name, receiver, amount);
 
-
-
-    // ❗❗ 不要 List、不睡、不 drain server
-    // 由於對方收到後會 pending_cmd → main 下一輪會自動更新
+    // ❗ 不在這裡 List，不碰 server
 }
 
 
 
 //------------------------------------------------------------------------------
-// 處理來自其他 client 的 P2P 傳入連線（完全無阻塞版）
+// 處理來自其他 client 的 P2P 傳入連線（TLS 版）
 //------------------------------------------------------------------------------
-static void handle_incoming_p2p(int p2p_sd, SSL *ssl) {
+static void handle_incoming_p2p(int p2p_sd, SSL *server_ssl) {
 
     struct sockaddr_in cli;
     socklen_t len = sizeof(cli);
     int conn = accept(p2p_sd, (struct sockaddr*)&cli, &len);
-    if (conn < 0) { perror("accept"); return; }
+    if (conn < 0) {
+        perror("accept");
+        return;
+    }
 
+    // 1️⃣ 建立 TLS（我是 server）
+    SSL *p2p_ssl = SSL_new(p2p_server_ctx);
+    SSL_set_fd(p2p_ssl, conn);
+
+    if (SSL_accept(p2p_ssl) <= 0) {
+        printf("[P2P][TLS] SSL_accept failed\n");
+        ERR_print_errors_fp(stderr);
+        SSL_free(p2p_ssl);
+        close(conn);
+        return;
+    }
+
+    // 2️⃣ 讀取資料（走 TLS）
     char buf[BUFSZ];
-    int n = recv(conn, buf, sizeof(buf)-1, 0);
-    if (n <= 0) { close(conn); return; }
-
+    int n = SSL_read(p2p_ssl, buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        SSL_shutdown(p2p_ssl);
+        SSL_free(p2p_ssl);
+        close(conn);
+        return;
+    }
     buf[n] = '\0';
 
     char sender[64], receiver[64];
@@ -415,23 +450,25 @@ static void handle_incoming_p2p(int p2p_sd, SSL *ssl) {
 
     if (sscanf(buf, "%[^#]#%d#%s", sender, &amount, receiver) != 3) {
         printf("[P2P] Invalid transfer format: %s\n", buf);
+        SSL_shutdown(p2p_ssl);
+        SSL_free(p2p_ssl);
         close(conn);
         return;
     }
 
-    // 1. 立刻印出訊息並強制刷新 (fflush)，確保使用者一定看得到
-    printf("\n[P2P] %s sent you %d\n", sender, amount);
-    fflush(stdout); 
+    // 3️⃣ 顯示收款
+    printf("\n[P2P][TLS] %s sent you %d\n", sender, amount);
+    fflush(stdout);
 
-    // 2. 直接將指令轉發給 Server
-     send_line_ssl(ssl, buf);   // ✅ 一定要走 TLS 
-    
-    // 3. 更新全域狀態
-    g_client_state = 1; // 進入 "AWAITING_TRANSFER_OK" 狀態
+    // 4️⃣ 轉發給 Server（用原本的 server TLS）
+    send_line_ssl(server_ssl, buf);
+    g_client_state = 1;
 
+    // 5️⃣ 關閉
+    SSL_shutdown(p2p_ssl);
+    SSL_free(p2p_ssl);
     close(conn);
 }
-
 
 
 //------------------------------------------------------------------------------
@@ -489,6 +526,34 @@ int main(int argc, char **argv)
     SSL_library_init();                 // 1. 載入 SSL/TLS 函式庫
     SSL_load_error_strings();           // 2. 載入錯誤訊息
     OpenSSL_add_all_algorithms();       // 3. 載入所有加密演算法（AES, RSA, SHA...）
+
+
+    // ================================
+    // P2P TLS Context（client ↔ client）
+    // ================================
+
+    // P2P 主動端（我連別人）
+    p2p_client_ctx = SSL_CTX_new(TLS_client_method());
+    SSL_CTX_set_min_proto_version(p2p_client_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(p2p_client_ctx, TLS1_2_VERSION);
+
+    // demo / 作業階段：不驗證對方憑證
+    SSL_CTX_set_verify(p2p_client_ctx, SSL_VERIFY_NONE, NULL);
+
+    // P2P 被動端（別人連我）
+    p2p_server_ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_set_min_proto_version(p2p_server_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(p2p_server_ctx, TLS1_2_VERSION);
+
+    // P2P server 需要憑證（你已經有 mycert.pem / mykey.pem）
+    SSL_CTX_use_certificate_file(p2p_server_ctx, "mycert.pem", SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(p2p_server_ctx, "mykey.pem", SSL_FILETYPE_PEM);
+
+    // demo / 作業階段：不驗證對方憑證
+    SSL_CTX_set_verify(p2p_server_ctx, SSL_VERIFY_NONE, NULL);
+
+
+
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());            // 建立 TLS client context
     
@@ -718,6 +783,11 @@ int main(int argc, char **argv)
 
     close(sd);
     if (listen_sd != -1) close(listen_sd);
+
+    SSL_CTX_free(p2p_client_ctx);
+    SSL_CTX_free(p2p_server_ctx);
+    SSL_CTX_free(ctx);
+
     return 0;
 }
 
